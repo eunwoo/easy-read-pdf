@@ -368,7 +368,7 @@ function buildLines(items, fontStyleMap) {
   let currentY = null;
   let lineMinX = Infinity;
   let lineMaxX = -Infinity;
-  let lastEndedBold = false;
+  let lineY = null;
 
   function pushLine() {
     if (currentSegments.length === 0) return;
@@ -383,6 +383,7 @@ function buildLines(items, fontStyleMap) {
         // Layout info for paragraph break detection
         xStart: lineMinX,
         xEnd: lineMaxX,
+        y: lineY,
         endsBold: lastSeg.bold === true,
         startsBold: firstSeg.bold === true,
       });
@@ -390,6 +391,7 @@ function buildLines(items, fontStyleMap) {
     currentSegments = [];
     lineMinX = Infinity;
     lineMaxX = -Infinity;
+    lineY = null;
   }
 
   function recordItemBox(item) {
@@ -397,6 +399,7 @@ function buildLines(items, fontStyleMap) {
     const w = item.width || 0;
     if (x < lineMinX) lineMinX = x;
     if (x + w > lineMaxX) lineMaxX = x + w;
+    if (lineY === null) lineY = item.transform[5];
   }
 
   for (const item of items) {
@@ -436,7 +439,76 @@ function buildLines(items, fontStyleMap) {
     }
   }
   pushLine();
-  return lines;
+
+  // ----- Multi-column layout detection -----
+  // If lines split into two clear X-position clusters (e.g. 2-column landscape
+  // PDFs from Google Docs), reorder them so each column reads top-to-bottom
+  // first, then move to the next column. Without this, lines from both
+  // columns get interleaved by content-stream order, making paragraphs
+  // hopelessly fragmented.
+  return reorderColumns(lines);
+}
+
+/**
+ * Detect 1- vs 2-column layout based on xStart distribution and reorder
+ * lines so each column is contiguous (top-to-bottom).
+ */
+function reorderColumns(lines) {
+  if (lines.length < 6) return lines; // too few to bother
+
+  const xStarts = lines
+    .map((l) => l.xStart)
+    .filter((x) => x !== undefined && x !== Infinity)
+    .sort((a, b) => a - b);
+
+  if (xStarts.length < 6) return lines;
+
+  // Find the overall horizontal span
+  const minX = xStarts[0];
+  const maxX = xStarts[xStarts.length - 1];
+  const span = maxX - minX;
+  if (span < 100) return lines; // narrow page, single column
+
+  // Look for a gap in xStart distribution that's wider than ~25% of the span.
+  // That gap is the column separator.
+  let bestGap = 0;
+  let bestGapMid = -1;
+  for (let i = 1; i < xStarts.length; i++) {
+    const gap = xStarts[i] - xStarts[i - 1];
+    if (gap > bestGap) {
+      bestGap = gap;
+      bestGapMid = (xStarts[i] + xStarts[i - 1]) / 2;
+    }
+  }
+
+  // Require the gap to be large (a real column gutter, not just word spacing)
+  if (bestGap < span * 0.2) return lines; // single column
+
+  // Also require both sides of the split to have a meaningful number of lines
+  const leftCount = lines.filter((l) => l.xStart < bestGapMid).length;
+  const rightCount = lines.length - leftCount;
+  if (leftCount < 3 || rightCount < 3) return lines;
+
+  // It's 2-column. Split, sort each side by Y descending (PDF coords:
+  // larger Y = higher on page), then concatenate left then right.
+  const left = lines.filter((l) => l.xStart < bestGapMid);
+  const right = lines.filter((l) => l.xStart >= bestGapMid);
+
+  const sortByYDesc = (a, b) => {
+    const ya = a.y !== null && a.y !== undefined ? a.y : 0;
+    const yb = b.y !== null && b.y !== undefined ? b.y : 0;
+    return yb - ya;
+  };
+
+  left.sort(sortByYDesc);
+  right.sort(sortByYDesc);
+
+  // Tag each line with its column so paragraph parsing knows where to
+  // compute its own "right edge" baseline.
+  for (const l of left) l.column = 'left';
+  for (const l of right) l.column = 'right';
+
+  return [...left, ...right];
 }
 
 function mergeAdjacentSegments(segments) {
@@ -529,38 +601,50 @@ function parseParagraphs(lines) {
   const isItemStart = (text) =>
     numberedStart.test(text) || bulletStart.test(text) || dashStart.test(text);
 
-  // Compute the "typical" right edge of full lines on this document.
-  // We collect line.xEnd values from lines that look like they wrap (long lines)
-  // and use the median as the page's right margin.
-  const xEnds = lines
-    .filter((l) => l.xEnd !== undefined && l.xEnd > -Infinity)
-    .map((l) => l.xEnd)
-    .sort((a, b) => a - b);
-  let pageRightEdge = 0;
-  if (xEnds.length > 0) {
-    // Use the 80th percentile as the "full line" right edge — this avoids
-    // being skewed by short lines or outliers.
-    pageRightEdge = xEnds[Math.floor(xEnds.length * 0.8)];
+  // Compute the "typical" right edge per column.
+  // For 2-column layouts, the left column ends much earlier than the right,
+  // so a single page-wide pageRightEdge gives bogus results.
+  function rightEdgeFor(filterFn) {
+    const xs = lines
+      .filter((l) => l.xEnd !== undefined && l.xEnd > -Infinity && filterFn(l))
+      .map((l) => l.xEnd)
+      .sort((a, b) => a - b);
+    if (xs.length === 0) return 0;
+    return xs[Math.floor(xs.length * 0.8)];
   }
-  // A line is considered "short" (likely ending a paragraph) if it ends
-  // noticeably to the left of the page right edge.
-  const SHORT_LINE_THRESHOLD = pageRightEdge * 0.85;
+  const rightEdgeAll = rightEdgeFor(() => true);
+  const rightEdgeLeft = rightEdgeFor((l) => l.column === 'left');
+  const rightEdgeRight = rightEdgeFor((l) => l.column === 'right');
 
-  // A line is a "hard break" (forces paragraph split before next line) when:
-  //  - it ends short AND
-  //  - it ends on bold text while the next line starts with non-bold text,
-  //    OR it ends short by a lot (less than 70% of right edge)
+  function pageRightEdgeFor(line) {
+    if (line.column === 'left' && rightEdgeLeft > 0) return rightEdgeLeft;
+    if (line.column === 'right' && rightEdgeRight > 0) return rightEdgeRight;
+    return rightEdgeAll;
+  }
+
+  // Sentence-ending punctuation. We require this for paragraph end.
+  const sentenceEndRe = /[.!?。!?…")'’”]\s*$/;
+
   function endsParagraph(line, nextLine) {
     if (!line || line.xEnd === undefined || line.xEnd <= -Infinity) return false;
-    const isShort = line.xEnd < SHORT_LINE_THRESHOLD;
-    const isVeryShort = line.xEnd < pageRightEdge * 0.7;
-    if (!isShort) return false;
+    const text = (line.plainText || '').trimEnd();
+    if (!text) return false;
 
-    // Very short lines (e.g. headings on their own) almost always end a paragraph.
-    if (isVeryShort) return true;
+    const re = pageRightEdgeFor(line);
+    if (re <= 0) return false;
 
-    // Bold-to-regular transition is a strong heading-end signal.
-    if (line.endsBold && nextLine && !nextLine.startsBold) return true;
+    const endsWithSentence = sentenceEndRe.test(text);
+    const isShort = line.xEnd < re * 0.92;
+    const isVeryShort = line.xEnd < re * 0.55;
+
+    // (a) Very short lines that end with sentence punctuation
+    if (isVeryShort && endsWithSentence) return true;
+
+    // (b) Bold-to-regular transition with a short line
+    if (isShort && line.endsBold && nextLine && !nextLine.startsBold) return true;
+
+    // (c) Short line ending with sentence punctuation
+    if (isShort && endsWithSentence) return true;
 
     return false;
   }
@@ -603,22 +687,21 @@ function parseParagraphs(lines) {
       // Empty line: this is either a real blank line OR a page boundary marker.
       // We DON'T want page boundaries to always end paragraphs, because a
       // paragraph can flow across pages. Only flush if the buffer's last line
-      // looks like a real paragraph ending (full-width line that ended with
-      // a sentence-ending punctuation, OR a noticeably short line).
+      // looks like a real paragraph ending: short AND ends with sentence
+      // punctuation, OR very short (heading-like) and ends with punctuation.
       if (buffer.length > 0) {
         const lastBufLine = buffer[buffer.length - 1];
         const lastText = (lastBufLine.plainText || '').trimEnd();
-        const endsWithPunct = /[.!?。！?…")]$/.test(lastText);
-        const lastIsShort =
-          lastBufLine.xEnd !== undefined &&
-          lastBufLine.xEnd > -Infinity &&
-          lastBufLine.xEnd < SHORT_LINE_THRESHOLD;
+        const endsWithPunct = sentenceEndRe.test(lastText);
+        const xe = lastBufLine.xEnd;
+        const hasX = xe !== undefined && xe > -Infinity;
+        const re = pageRightEdgeFor(lastBufLine);
+        const lastIsShort = hasX && re > 0 && xe < re * 0.92;
+        const lastIsVeryShort = hasX && re > 0 && xe < re * 0.55;
 
-        // Only end the paragraph at a blank/page-break if the last line
-        // shows a real ending signal: short AND ends with punctuation,
-        // or is very short (heading-like).
-        if ((lastIsShort && endsWithPunct) ||
-            (lastBufLine.xEnd !== undefined && lastBufLine.xEnd < pageRightEdge * 0.7)) {
+        if (lastIsShort && endsWithPunct) {
+          flush();
+        } else if (lastIsVeryShort && endsWithPunct) {
           flush();
         }
       }
@@ -631,6 +714,29 @@ function parseParagraphs(lines) {
       buffer.push(line);
     } else {
       buffer.push(line);
+    }
+
+    // Column transition (left → right in 2-column layouts):
+    // A long sentence may flow from the bottom of the left column into the
+    // top of the right column, so we should NOT force a paragraph break here.
+    // Only end the paragraph if the last left-column line shows real
+    // ending signals (sentence-ending punctuation), same as page-boundary
+    // logic. Otherwise the paragraph keeps flowing into the next column.
+    const nextIsDifferentColumn =
+      nextLine && line.column && nextLine.column &&
+      line.column !== nextLine.column;
+
+    if (nextIsDifferentColumn) {
+      const lastText = (line.plainText || '').trimEnd();
+      const endsWithPunct = sentenceEndRe.test(lastText);
+      // For column transitions, we use a softer rule than for in-column
+      // breaks: the last line of a column is naturally short (it just
+      // ran out of column height), so we can't use shortness as a signal.
+      // We rely solely on sentence-ending punctuation.
+      if (endsWithPunct) {
+        flush();
+      }
+      continue;
     }
 
     // Skip layout-based break detection at the page boundary —
